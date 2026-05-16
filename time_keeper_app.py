@@ -288,6 +288,14 @@ class TimeKeeperApp:
             entry.get("seconds", 0) for entry in self.session_entries if entry.get("date") == self.today_date
         )
 
+    def sync_main_timer_from_sessions(self) -> None:
+        self.recalculate_totals()
+        if self.running:
+            self.resume_elapsed_base = float(self.all_time_total_seconds)
+        else:
+            self.elapsed_seconds = float(self.all_time_total_seconds)
+        self.update_buttons()
+
     def seed_test_sessions_if_empty(self) -> None:
         if self.session_entries:
             return
@@ -484,7 +492,7 @@ class TimeKeeperApp:
         sessions_window = tk.Toplevel(self.root)
         self.sessions_window = sessions_window
         sessions_window.title("Session Log")
-        sessions_window.geometry("600x380")
+        sessions_window.geometry("720x380")
         sessions_window.resizable(False, False)
         sessions_window.transient(self.root)
         sessions_window.grab_set()
@@ -526,7 +534,14 @@ class TimeKeeperApp:
             fg="white",
         ).grid(row=0, column=1, padx=4)
 
-        sessions_list = tk.Listbox(sessions_window, width=78, height=12, font=("Consolas", 10))
+        sessions_list = tk.Listbox(
+            sessions_window,
+            width=92,
+            height=12,
+            font=("Consolas", 10),
+            selectmode=tk.SINGLE,
+            activestyle="dotbox",
+        )
         sessions_list.pack(padx=12, pady=6)
 
         footer = tk.Label(
@@ -536,14 +551,18 @@ class TimeKeeperApp:
         )
         footer.pack(pady=(8, 10))
 
+        def session_line_text(index: int, entry: dict) -> str:
+            duration = self.format_time(entry.get("seconds", 0))
+            return (
+                f"{index:02}. {entry['start']} -> {entry['end']}  ({duration})  |  "
+                f"{entry.get('description', 'No Description')}"
+            )
+
         def refresh_sessions_list() -> None:
             sessions_list.delete(0, tk.END)
             if view_mode.get() == "current":
                 for index, entry in enumerate(self.session_entries, start=1):
-                    sessions_list.insert(
-                        tk.END,
-                        f"{index:02}. {entry['start']} -> {entry['end']}   |   {entry.get('description', 'No Description')}",
-                    )
+                    sessions_list.insert(tk.END, session_line_text(index, entry))
 
                 running_segment = self.running_segment_seconds()
                 if running_segment > 0:
@@ -568,9 +587,11 @@ class TimeKeeperApp:
                         f"Week {week_index:02} | Start: {week_id} | Closed: {closed_at} | Total: {self.format_time(week_total)}",
                     )
                     for entry in week.get("entries", []):
+                        duration = self.format_time(entry.get("seconds", 0))
                         sessions_list.insert(
                             tk.END,
-                            f"   - {entry['start']} -> {entry['end']}   |   {entry.get('description', 'No Description')}",
+                            f"   - {entry['start']} -> {entry['end']}  ({duration})  |  "
+                            f"{entry.get('description', 'No Description')}",
                         )
                     sessions_list.insert(tk.END, "")
 
@@ -603,7 +624,7 @@ class TimeKeeperApp:
             if not confirm:
                 return
             self.session_entries.pop(selected_index)
-            self.recalculate_totals()
+            self.sync_main_timer_from_sessions()
             self.save_state()
             refresh_sessions_list()
 
@@ -671,7 +692,7 @@ class TimeKeeperApp:
                 entry["date"] = start_dt.strftime("%Y-%m-%d")
                 entry["seconds"] = int((end_dt - start_dt).total_seconds())
                 entry["description"] = description
-                self.recalculate_totals()
+                self.sync_main_timer_from_sessions()
                 self.save_state()
                 refresh_sessions_list()
                 editor.destroy()
@@ -681,7 +702,7 @@ class TimeKeeperApp:
                 if not confirm:
                     return
                 self.session_entries.pop(selected_index)
-                self.recalculate_totals()
+                self.sync_main_timer_from_sessions()
                 self.save_state()
                 refresh_sessions_list()
                 editor.destroy()
@@ -694,9 +715,8 @@ class TimeKeeperApp:
             )
             tk.Button(button_row, text="Cancel", width=10, command=editor.destroy).grid(row=0, column=2, padx=6)
 
-        def on_select(_event: tk.Event) -> None:
+        def on_double_click(_event: tk.Event) -> None:
             if view_mode.get() != "current":
-                sessions_list.selection_clear(0, tk.END)
                 return
             selection = sessions_list.curselection()
             if not selection:
@@ -705,7 +725,6 @@ class TimeKeeperApp:
             if selected_index >= len(self.session_entries):
                 return
             edit_session_at_index(selected_index)
-            sessions_list.selection_clear(0, tk.END)
 
         delete_button = tk.Button(
             sessions_window,
@@ -728,7 +747,7 @@ class TimeKeeperApp:
         copy_button.pack(pady=(0, 8))
 
         sessions_list.bind("<Delete>", lambda _event: delete_selected_session())
-        sessions_list.bind("<<ListboxSelect>>", on_select)
+        sessions_list.bind("<Double-Button-1>", on_double_click)
         refresh_sessions_list()
 
     def running_segment_seconds(self) -> float:
