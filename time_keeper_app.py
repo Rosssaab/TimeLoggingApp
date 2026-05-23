@@ -161,12 +161,13 @@ class TimeKeeperApp:
         self.normalize_all_entries()
         self.load_archived_weeks(data.get("archived_weeks_json", ""))
 
-        # If app was closed while running, continue counting from the stored start timestamp.
-        if self.running and self.started_at is None:
-            self.running = False
+        # If the timer was left running (e.g. PC shutdown), stop it and do not count downtime.
         if self.running:
-            self.resume_elapsed_base = self.elapsed_seconds
-            self.current_session_started_at_ts = time.time() - self.running_segment_seconds()
+            self.running = False
+            self.started_at = None
+            self.current_session_started_at_ts = None
+            self.resume_elapsed_base = float(self.elapsed_seconds)
+            self.save_state()
 
         current_date = datetime.now().strftime("%Y-%m-%d")
         if self.today_date != current_date:
@@ -492,7 +493,7 @@ class TimeKeeperApp:
         sessions_window = tk.Toplevel(self.root)
         self.sessions_window = sessions_window
         sessions_window.title("Session Log")
-        sessions_window.geometry("720x380")
+        sessions_window.geometry("720x470")
         sessions_window.resizable(False, False)
         sessions_window.transient(self.root)
         sessions_window.grab_set()
@@ -537,19 +538,48 @@ class TimeKeeperApp:
         sessions_list = tk.Listbox(
             sessions_window,
             width=92,
-            height=12,
+            height=9,
             font=("Consolas", 10),
             selectmode=tk.SINGLE,
             activestyle="dotbox",
         )
-        sessions_list.pack(padx=12, pady=6)
+        sessions_list.pack(padx=12, pady=(4, 4))
 
         footer = tk.Label(
             sessions_window,
             text="Total Logged Time: 00:00:00",
             font=("Segoe UI", 10, "bold"),
         )
-        footer.pack(pady=(8, 10))
+        footer.pack(pady=(4, 4))
+
+        adjust_frame = tk.Frame(sessions_window)
+        adjust_frame.pack(fill="x", padx=12, pady=(0, 4))
+
+        adjust_label = tk.Label(
+            adjust_frame,
+            text="Select a session, then slide to adjust the end time (left = shorter, right = longer).",
+            font=("Segoe UI", 9),
+            anchor="w",
+        )
+        adjust_label.pack(fill="x")
+
+        end_slider = tk.Scale(
+            adjust_frame,
+            from_=0,
+            to=1,
+            orient=tk.HORIZONTAL,
+            length=680,
+            resolution=60,
+            showvalue=0,
+            state="disabled",
+        )
+        end_slider.pack(fill="x", pady=(2, 0))
+
+        end_preview = tk.Label(adjust_frame, text="", font=("Segoe UI", 9), anchor="w")
+        end_preview.pack(fill="x", pady=(2, 0))
+
+        slider_context: dict = {"index": None, "start_ts": None, "original_end_ts": None}
+        slider_updating = {"active": False}
 
         def session_line_text(index: int, entry: dict) -> str:
             duration = self.format_time(entry.get("seconds", 0))
@@ -557,6 +587,121 @@ class TimeKeeperApp:
                 f"{index:02}. {entry['start']} -> {entry['end']}  ({duration})  |  "
                 f"{entry.get('description', 'No Description')}"
             )
+
+        def reset_end_slider() -> None:
+            slider_context["index"] = None
+            slider_context["start_ts"] = None
+            slider_context["original_end_ts"] = None
+            end_slider.config(state="disabled")
+            end_preview.config(text="")
+            revert_end_button.config(state="disabled")
+
+        def update_week_total_footer() -> None:
+            running_segment = self.running_segment_seconds()
+            total_seconds = self.all_time_total_seconds + running_segment
+            footer.config(text=f"Current Week Total: {self.format_time(total_seconds)}")
+
+        def update_end_slider_preview(end_ts: float) -> None:
+            start_ts = slider_context.get("start_ts")
+            original_end_ts = slider_context.get("original_end_ts")
+            if start_ts is None or original_end_ts is None:
+                return
+            duration = max(0, int(end_ts - start_ts))
+            delta = int(end_ts - original_end_ts)
+            end_text = datetime.fromtimestamp(end_ts).strftime("%Y-%m-%d %H:%M:%S")
+            preview = f"End: {end_text}  |  Duration: {self.format_time(duration)}"
+            if delta < 0:
+                preview += f"  |  Reduced by: {self.format_time(-delta)}"
+            elif delta > 0:
+                preview += f"  |  Increased by: {self.format_time(delta)}"
+            end_preview.config(text=preview)
+
+        def commit_slider_end_time(end_ts: float, *, save: bool = False) -> None:
+            selected_index = slider_context.get("index")
+            start_ts = slider_context.get("start_ts")
+            if selected_index is None or start_ts is None:
+                return
+            if end_ts <= start_ts:
+                return
+
+            entry = self.session_entries[selected_index]
+            start_dt = datetime.fromtimestamp(start_ts)
+            new_end_dt = datetime.fromtimestamp(end_ts)
+            entry["end"] = new_end_dt.strftime("%Y-%m-%d %H:%M:%S")
+            entry["date"] = start_dt.strftime("%Y-%m-%d")
+            entry["seconds"] = int(end_ts - start_ts)
+            self.sync_main_timer_from_sessions()
+
+            slider_updating["active"] = True
+            try:
+                if selected_index < sessions_list.size():
+                    sessions_list.delete(selected_index)
+                    sessions_list.insert(selected_index, session_line_text(selected_index + 1, entry))
+                    sessions_list.selection_set(selected_index)
+                    sessions_list.see(selected_index)
+            finally:
+                slider_updating["active"] = False
+
+            update_week_total_footer()
+            update_end_slider_preview(end_ts)
+            if save:
+                self.save_state()
+
+        def on_end_slider_change(value: str) -> None:
+            if slider_context["index"] is None:
+                return
+            commit_slider_end_time(float(value), save=False)
+
+        def on_end_slider_release(_event: tk.Event) -> None:
+            if slider_context["index"] is None:
+                return
+            commit_slider_end_time(float(end_slider.get()), save=True)
+
+        def load_end_slider_for_selection() -> None:
+            if slider_updating["active"]:
+                return
+            if view_mode.get() != "current":
+                reset_end_slider()
+                return
+            selection = sessions_list.curselection()
+            if not selection or selection[0] >= len(self.session_entries):
+                reset_end_slider()
+                return
+
+            selected_index = selection[0]
+            entry = self.session_entries[selected_index]
+            try:
+                start_dt = datetime.strptime(entry["start"], "%Y-%m-%d %H:%M:%S")
+                end_dt = datetime.strptime(entry["end"], "%Y-%m-%d %H:%M:%S")
+            except ValueError:
+                reset_end_slider()
+                return
+            if end_dt <= start_dt:
+                reset_end_slider()
+                return
+
+            start_ts = start_dt.timestamp()
+            end_ts = end_dt.timestamp()
+            min_end_ts = start_ts + 60
+            max_end_ts = max(end_ts, datetime.now().timestamp())
+
+            slider_context["index"] = selected_index
+            slider_context["start_ts"] = start_ts
+            slider_context["original_end_ts"] = end_ts
+            end_slider.config(from_=min_end_ts, to=max_end_ts, state="normal")
+            end_slider.set(end_ts)
+            revert_end_button.config(state="normal")
+            update_end_slider_preview(end_ts)
+
+        def revert_end_time() -> None:
+            original_end_ts = slider_context.get("original_end_ts")
+            if original_end_ts is None:
+                return
+            end_slider.set(original_end_ts)
+            commit_slider_end_time(original_end_ts, save=True)
+
+        end_slider.config(command=on_end_slider_change)
+        end_slider.bind("<ButtonRelease-1>", on_end_slider_release)
 
         def refresh_sessions_list() -> None:
             sessions_list.delete(0, tk.END)
@@ -575,6 +720,9 @@ class TimeKeeperApp:
                 footer.config(text=f"Current Week Total: {self.format_time(total_seconds)}")
                 delete_button.config(state="normal")
                 copy_button.config(state="normal")
+                revert_end_button.config(state="disabled" if slider_context["index"] is None else "normal")
+                if slider_context["index"] is not None:
+                    update_week_total_footer()
             else:
                 if not self.archived_weeks:
                     sessions_list.insert(tk.END, "-- No archived weeks yet --")
@@ -599,11 +747,13 @@ class TimeKeeperApp:
                 footer.config(text=f"Archived Total: {self.format_time(archived_total)}")
                 delete_button.config(state="disabled")
                 copy_button.config(state="disabled")
+                reset_end_slider()
 
         def set_view_mode(mode: str) -> None:
             if mode not in ("current", "archived"):
                 return
             view_mode.set(mode)
+            reset_end_slider()
             refresh_sessions_list()
 
         def delete_selected_session() -> None:
@@ -626,6 +776,7 @@ class TimeKeeperApp:
             self.session_entries.pop(selected_index)
             self.sync_main_timer_from_sessions()
             self.save_state()
+            reset_end_slider()
             refresh_sessions_list()
 
         def copy_sessions_for_invoice() -> None:
@@ -726,28 +877,43 @@ class TimeKeeperApp:
                 return
             edit_session_at_index(selected_index)
 
+        button_row = tk.Frame(sessions_window)
+        button_row.pack(pady=(4, 10))
+
         delete_button = tk.Button(
-            sessions_window,
-            text="Delete Selected Session",
-            width=26,
+            button_row,
+            text="Delete Session",
+            width=20,
             command=delete_selected_session,
             bg="#8E0000",
             fg="white",
         )
-        delete_button.pack(pady=(0, 6))
+        delete_button.grid(row=0, column=0, padx=4)
+
+        revert_end_button = tk.Button(
+            button_row,
+            text="Revert End Time",
+            width=20,
+            command=revert_end_time,
+            bg="#E65100",
+            fg="white",
+            state="disabled",
+        )
+        revert_end_button.grid(row=0, column=1, padx=4)
 
         copy_button = tk.Button(
-            sessions_window,
-            text="Copy Sessions for Invoice",
-            width=26,
+            button_row,
+            text="Copy for Invoice",
+            width=20,
             command=copy_sessions_for_invoice,
             bg="#2E7D32",
             fg="white",
         )
-        copy_button.pack(pady=(0, 8))
+        copy_button.grid(row=0, column=2, padx=4)
 
         sessions_list.bind("<Delete>", lambda _event: delete_selected_session())
         sessions_list.bind("<Double-Button-1>", on_double_click)
+        sessions_list.bind("<<ListboxSelect>>", lambda _event: load_end_slider_for_selection())
         refresh_sessions_list()
 
     def running_segment_seconds(self) -> float:
@@ -901,15 +1067,10 @@ class TimeKeeperApp:
 
     def on_close(self) -> None:
         if self.running:
-            segment_seconds = self.running_segment_seconds()
-            self.elapsed_seconds = self.current_elapsed()
-            self.all_time_total_seconds += segment_seconds
-            self.today_total_seconds += segment_seconds
-            self.append_completed_session(segment_seconds)
-            self.recalculate_totals()
             self.running = False
             self.started_at = None
             self.current_session_started_at_ts = None
+            self.elapsed_seconds = self.resume_elapsed_base
         self.save_state()
         self.root.destroy()
 
